@@ -11,12 +11,14 @@ license: apache-2.0
 
 # Pocket Voice（Hugging Face Space）
 
+> **2026-11 實測：Hugging Face 免費的 CPU basic 已經不能用了**，要選付費硬體才跑得起來。沒有付費的話，請改用自己的電腦（見根目錄 README「iPhone 连电脑」）。
+
 這個 Space 跑的就是 `server/`：匯入一次聲音樣本，之後把任意中文唸成同一個聲音。模型是 [MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS-Nano)（Apache-2.0）。
 
 ## 怎麼建立（給沒有小電腦的用戶）
 
 1. 註冊 Hugging Face，右上角 **New → Space**。
-2. 名字隨意，**SDK 選 Docker**，模板選 **Blank**，硬體選免費的 **CPU basic**，**Visibility 選 Private**。
+2. 名字隨意，**SDK 選 Docker**，模板選 **Blank**，硬體選付費的 CPU（免費 CPU basic 已不能用），**Visibility 選 Private**。
 3. 建好後到 **Files → Add file → Upload files**，上傳這五個檔：
    - 這份 `README.md`（覆蓋原本的）
    - `server/Dockerfile`
