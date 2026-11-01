@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "release/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: v
+        run: |
+          apk=$(ls release/pocket-voice-*.apk | head -1)
+          ver=$(basename "$apk" .apk | sed 's/^pocket-voice-//')
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          (cd release && sha256sum -c SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.v.outputs.ver }}
+          target_commitish: ${{ github.sha }}
+          name: Pocket Voice ${{ steps.v.outputs.ver }}
+          body_path: release/NOTES.md
+          make_latest: true
+          files: |
+            ${{ steps.v.outputs.apk }}
+            release/SHA256SUMS

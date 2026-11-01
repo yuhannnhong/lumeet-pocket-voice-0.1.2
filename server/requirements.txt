@@ -1,0 +1,14 @@
+# MOSS-TTS-Nano ONNX 推論（不含 PyTorch）
+numpy>=1.24
+sentencepiece>=0.1.99
+onnxruntime>=1.20.0
+soundfile>=0.12
+scipy>=1.11
+# 文字前處理、輸出
+opencc-python-reimplemented>=0.1.7
+lameenc>=1.7
+# 伺服器
+fastapi>=0.110.0
+python-multipart>=0.0.9
+uvicorn>=0.29.0
+huggingface_hub>=0.24

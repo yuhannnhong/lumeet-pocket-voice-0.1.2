@@ -1,0 +1,6 @@
+lumeet-pocket-voice
+Copyright 2026 yuhannnhong
+
+This project uses MOSS-TTS-Nano and MOSS-Audio-Tokenizer-Nano by OpenMOSS,
+licensed under the Apache License, Version 2.0.
+https://github.com/OpenMOSS/MOSS-TTS-Nano
