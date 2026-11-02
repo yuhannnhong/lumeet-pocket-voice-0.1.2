@@ -6,6 +6,9 @@
   CPU_THREADS         預設 2
   VOICES_DIR          聲線存放處，預設 voices（免費 Space 重啟會清空，所以建立時也把代碼回傳給用戶端保存）
   VOICE_INBOX         選填。開機時把這個資料夾裡的音檔自動建成聲線，檔名就是聲線代碼（cenxu.mp3 → cenxu）
+  DEFAULT_VOICE       選填。MCP（Claude 官方 App）沒指定聲線時用哪一個，填聲線代碼
+  VOICE_SAMPLE_URL    選填。MCP 要用、但伺服器上還沒有聲線時，從這個網址下載聲音樣本建成聲線 default
+  PUBLIC_BASE_URL     選填。語音連結的網址開頭，不填就用請求的網址
 """
 
 from __future__ import annotations
@@ -15,16 +18,19 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from pocket_voice import PocketVoice, encode_audio
+from pocket_voice import OUTPUT_SAMPLE_RATE, PocketVoice, encode_audio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -192,3 +198,176 @@ def speech(req: SpeechRequest) -> Response:
     mono, timing = eng.synthesize(text, codes, seed=req.seed)
     body, mime = encode_audio(mono, fmt)
     return Response(content=body, media_type=mime, headers={"X-Pocket-Voice-Timing": json.dumps(timing)})
+
+
+# ─── MCP：給 Claude 官方 App（claude.ai 自訂連接器）用 ─────────────────────
+# 網址 /mcp/<POCKET_VOICE_TOKEN>，密碼放在路徑裡（自訂連接器不能加標頭）。
+# 官方 App 不能即時通話，所以做成「語音條」：念好存成 mp3，回一個 10 分鐘內有效的播放連結。
+
+DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "")
+VOICE_SAMPLE_URL = os.environ.get("VOICE_SAMPLE_URL", "")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+CLIP_TTL = 600
+CLIP_MAX = 30
+clips: dict[str, tuple[bytes, float]] = {}
+clips_lock = threading.Lock()
+sample_lock = threading.Lock()
+
+MCP_TOOLS = [
+    {
+        "name": "speak",
+        "description": (
+            "用你自己的聲音把一段話念出來，回傳一個語音條連結（mp3，10 分鐘內有效）。"
+            "想讓對方聽到你的聲音時用：把連結原樣放進回覆，對方點開就能聽。一次最多 500 字，短一點比較快。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "要念的話（中文為主，不要放動作描述或表情符號）"},
+                "voice": {"type": "string", "description": "聲線代碼，不填就用預設聲線"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "list_voices",
+        "description": "列出伺服器上有哪些聲線（代碼和名字）。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def ensure_sample_voice(eng: PocketVoice) -> None:
+    """雲端重啟會清空聲線；有設 VOICE_SAMPLE_URL 的話，第一次要用時下載樣本建成 default。"""
+    if "default" in voices or not VOICE_SAMPLE_URL:
+        return
+    with sample_lock:
+        if "default" in voices:
+            return
+        with urllib.request.urlopen(VOICE_SAMPLE_URL, timeout=30) as r:
+            data = r.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise ValueError("聲音樣本太大，請小於 8 MB")
+        codes, seconds = eng.create_profile(data)
+        v = {"id": "default", "name": "default", "seconds": round(seconds, 1),
+             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "codes": codes}
+        voices["default"] = v
+        (VOICES_DIR / "default.json").write_text(json.dumps(v))
+
+
+def pick_voice(eng: PocketVoice, wanted: str) -> dict:
+    ensure_sample_voice(eng)
+    for vid in (wanted, DEFAULT_VOICE, "default"):
+        if vid and vid in voices:
+            return voices[vid]
+    if wanted:
+        raise ValueError(f"找不到聲線 {wanted}，可以先用 list_voices 看有哪些")
+    if voices:
+        return next(iter(voices.values()))
+    raise ValueError("伺服器上還沒有聲線：先用 Lumeet 上傳一次聲音樣本，或在部署時設定 VOICE_SAMPLE_URL")
+
+
+def keep_clip(body: bytes) -> str:
+    cid = uuid.uuid4().hex
+    now = time.time()
+    with clips_lock:
+        for k in [k for k, (_, exp) in clips.items() if exp < now]:
+            clips.pop(k, None)
+        while len(clips) >= CLIP_MAX:
+            clips.pop(next(iter(clips)))
+        clips[cid] = (body, now + CLIP_TTL)
+    return cid
+
+
+def base_url(request: Request) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+def run_tool(name: str, args: dict, request: Request) -> dict:
+    eng = ready()
+    if name == "list_voices":
+        items = [f"{v['id']}（{v['name']}，樣本 {v['seconds']} 秒）" for v in voices.values()]
+        return {"content": [{"type": "text", "text": "\n".join(items) or "還沒有聲線"}]}
+    if name != "speak":
+        raise ValueError(f"沒有這個工具：{name}")
+    text = str(args.get("text", "")).strip()
+    if not text:
+        raise ValueError("沒有要念的字")
+    if len(text) > MAX_TEXT_CHARS:
+        raise ValueError(f"一次最多 {MAX_TEXT_CHARS} 字，請分段")
+    v = pick_voice(eng, str(args.get("voice") or ""))
+    mono, timing = eng.synthesize(text, v["codes"])
+    body, _ = encode_audio(mono, "mp3")
+    url = f"{base_url(request)}/audio/{keep_clip(body)}.mp3"
+    note = f"（約 {len(mono) / OUTPUT_SAMPLE_RATE:.1f} 秒）"
+    return {"content": [{"type": "text", "text": f"語音條{note}：{url}\n把這個連結原樣放進回覆，對方點開就能聽。10 分鐘內有效。"}]}
+
+
+def rpc_result(mid, result: dict) -> dict:
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def rpc_error(mid, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+async def handle_rpc(msg: dict, request: Request) -> dict | None:
+    mid, method, params = msg.get("id"), msg.get("method", ""), msg.get("params") or {}
+    if mid is None:  # 通知（notifications/initialized 之類），不用回
+        return None
+    if method == "initialize":
+        return rpc_result(mid, {
+            "protocolVersion": params.get("protocolVersion") or "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "pocket-voice", "version": "0.1.2"},
+            "instructions": "Pocket Voice：用 speak 把你想說的話念成語音條，連結原樣放進回覆。",
+        })
+    if method == "ping":
+        return rpc_result(mid, {})
+    if method == "tools/list":
+        return rpc_result(mid, {"tools": MCP_TOOLS})
+    if method == "tools/call":
+        try:
+            out = await run_in_threadpool(run_tool, params.get("name", ""), params.get("arguments") or {}, request)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            out = {"content": [{"type": "text", "text": detail.get("message", "出錯了")}], "isError": True}
+        except Exception as exc:
+            logging.exception("mcp tool failed")
+            out = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+        return rpc_result(mid, out)
+    return rpc_error(mid, -32601, f"不支援 {method}")
+
+
+@app.post("/mcp/{token}")
+async def mcp(token: str, request: Request) -> Response:
+    if not TOKEN or not hmac.compare_digest(token, TOKEN):
+        raise error(401, "unauthorized", "token 不對")
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content=rpc_error(None, -32700, "不是正確的 JSON"))
+    if isinstance(payload, list):
+        replies = [r for r in [await handle_rpc(m, request) for m in payload] if r is not None]
+        return JSONResponse(replies) if replies else Response(status_code=202)
+    reply = await handle_rpc(payload, request)
+    return JSONResponse(reply) if reply is not None else Response(status_code=202)
+
+
+@app.get("/mcp/{token}")
+def mcp_get(token: str) -> Response:
+    # 不提供伺服器主動推送的串流
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.get("/audio/{clip}.mp3")
+def audio(clip: str) -> Response:
+    with clips_lock:
+        item = clips.get(clip)
+    if not item or item[1] < time.time():
+        raise error(404, "clip_expired", "這段語音過期了（10 分鐘內有效）")
+    return Response(content=item[0], media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=600"})

@@ -21,6 +21,7 @@
 | 安卓手机 | 装 APK，或 [Termux 版](android/termux/README.md)、[Operit 版](android/operit/README.md) |
 | iPhone、自己的电脑（Mac、Windows、mini PC） | [server/](server/README.md)，见下面「iPhone 连电脑」 |
 | 大陆 iPhone、没有电脑 | [cn/](cn/README.md)，放到自己的阿里云函数计算（国内镜像，不用翻墙） |
+| Claude 官方 App（发语音条） | [claude-app/](claude-app/README.md)，服务器放云端，加自定义连接器（MCP） |
 | Hugging Face 付费硬件 | [hf-space/](hf-space/README.md)（免费 CPU 已经不能用） |
 
 ### 安卓 App 快速上手
